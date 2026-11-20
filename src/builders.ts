@@ -597,6 +597,19 @@ class DummyComponent extends Component {
 type PTree = Map<PackagePath, PTree>
 type PTreeI = Iterable<[PackagePath, PTree]>
 
+/**
+ * node of the segment-trie that {@link TreeBuilder.nestPT} builds
+ * to find each path's longest-prefix parent in linear time.
+ */
+interface PTreeTrieNode {
+  children: Map<string, PTreeTrieNode>
+  parent?: PTreeTrieNode
+  /** full path key - set on terminal nodes only */
+  key?: PackagePath
+  /** the path's own subtree - set on terminal nodes only */
+  pTree?: PTree
+}
+
 export class TreeBuilder {
   fromPaths (root: PackagePath, paths: Iterable<PackagePath>, dirSeparator: string): PTree {
     root += dirSeparator /* eslint-disable-line  no-param-reassign -- ack */
@@ -604,10 +617,10 @@ export class TreeBuilder {
     const outs = new Set<PackagePath>(iterableFilter(upaths, p => !p.startsWith(root)))
     /* eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- ack */
     const inTree: PTree = new Map(iterableMap(setDifference(upaths, outs), p => [p, new Map()]))
-    this.nestPT(inTree)
+    this.nestPT(inTree, dirSeparator)
     /* eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- ack */
     const outTree: PTree = new Map(iterableMap(outs, p => [p, new Map()]))
-    this.nestPT(outTree)
+    this.nestPT(outTree, dirSeparator)
     const tree: PTree = new Map()
     outTree.forEach((v,k) => { tree.set(k, v) } )
     inTree.forEach((v,k) => { tree.set(k, v) })
@@ -625,23 +638,58 @@ export class TreeBuilder {
     }
   }
 
-  private nestPT(tree: PTree): void {
-    if (tree.size < 2) { return } // nothing to compare ...
-    const treeI: PTreeI = Array.from(tree)
-    for (const [a, aTree] of treeI) {
-      for (const [b, bTree] of treeI) {
-        if (a === b) { continue }
-        if (b.startsWith(a)) {
-          aTree.set(b.slice(a.length), bTree)
-          tree.delete(b)
-        } else if (a.startsWith(b)) {
-          bTree.set(a.slice(b.length), aTree)
-          tree.delete(a)
+  private nestPT (tree: PTree, dirSeparator: string): void {
+    if (tree.size < 2) { return } // nothing to nest ...
+    // Linear-time nesting.
+    // A path's parent in the tree is the longest *other* path that is a prefix of it.
+    // Since every path ends on the dirSeparator, prefix-relations align with segment boundaries,
+    // so a segment-trie finds the same parents as the previous all-pairs comparison did.
+    // Entries are attached in the insertion order of `tree`,
+    // so the order of children and of top-level roots is preserved as before.
+    const trieRoot: PTreeTrieNode = { children: new Map() }
+    const terminals: PTreeTrieNode[] = []
+    // pass 1: index all paths in the segment-trie
+    for (const [p, pTree] of tree) {
+      const segments = p.split(dirSeparator)
+      // every path ends on the dirSeparator, so the last segment is empty - drop it,
+      // so that a path's terminal node sits on the ancestor chain of its descendants
+      if (segments[segments.length - 1] === '') { segments.pop() }
+      let node = trieRoot
+      for (const segment of segments) {
+        let next = node.children.get(segment)
+        if (next === undefined) {
+          next = { children: new Map(), parent: node }
+          node.children.set(segment, next)
         }
+        node = next
+      }
+      node.key = p
+      node.pTree = pTree
+      terminals.push(node)
+    }
+    // pass 2: attach each path to its deepest ancestor that is a path itself
+    const roots: Array<[PackagePath, PTree]> = []
+    for (const terminal of terminals) {
+      const { key, pTree } = terminal
+      /* c8 ignore next 2 -- terminals always carry key and pTree */
+      if (key === undefined || pTree === undefined) { continue }
+      let ancestor = terminal.parent
+      while (ancestor !== undefined && ancestor.pTree === undefined) {
+        ancestor = ancestor.parent
+      }
+      if (ancestor === undefined) {
+        roots.push([key, pTree])
+      } else {
+        const ancestorPTree = ancestor.pTree
+        const ancestorKey = ancestor.key
+        /* c8 ignore next 2 -- a marked ancestor always carries key and pTree */
+        if (ancestorPTree === undefined || ancestorKey === undefined) { continue }
+        ancestorPTree.set(key.slice(ancestorKey.length), pTree)
       }
     }
-    for (const c of tree.values()) {
-      this.nestPT(c)
+    tree.clear()
+    for (const [p, pTree] of roots) {
+      tree.set(p, pTree)
     }
   }
 }
